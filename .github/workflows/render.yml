@@ -49,26 +49,63 @@ jobs:
           credit = os.environ.get("STREAMER_TAG", "Credit: @Twitch").replace("\n", " ").replace("{", "").replace("}", "")
           clip_id = os.environ.get("CLIP_ID", "output")
 
-          ts_files = []
+          valid_mp4s = []
+          accumulated_dur = 0.0
+
           for idx, url in enumerate(urls):
+              if accumulated_dur >= 65.0:
+                  break
               raw_file = f"raw_{idx}.mp4"
-              ts_file = f"norm_{idx}.ts"
-              subprocess.run(["curl", "-L", "--fail", "--retry", "3", "-A", "Mozilla/5.0", url, "-o", raw_file], check=True)
+              norm_file = f"norm_{idx}.mp4"
+              
+              # Lade Clip herunter (ohne Abbruch bei toter Einzel-URL)
+              dl = subprocess.run(["curl", "-L", "--fail", "--retry", "2", "-A", "Mozilla/5.0", url, "-o", raw_file])
+              if dl.returncode != 0 or not os.path.exists(raw_file) or os.path.getsize(raw_file) < 50000:
+                  print(f"Überspringe defekte URL {idx}")
+                  continue
+
+              # Normalisiere mit fester Timescale (30000) für nahtlosen Zusammenschnitt
               norm_cmd = [
                   "ffmpeg", "-y", "-i", raw_file,
                   "-vf", "scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2,fps=30,format=yuv420p",
                   "-af", "aresample=44100,aformat=sample_fmts=fltp:channel_layouts=stereo",
-                  "-c:v", "libx264", "-preset", "ultrafast", "-crf", "20",
-                  "-c:a", "aac", "-b:a", "128k", "-f", "mpegts", ts_file
+                  "-c:v", "libx264", "-preset", "ultrafast", "-crf", "20", "-video_track_timescale", "30000",
+                  "-c:a", "aac", "-b:a", "128k", norm_file
               ]
-              subprocess.run(norm_cmd, check=True)
-              ts_files.append(ts_file)
+              if subprocess.run(norm_cmd).returncode == 0:
+                  probe = subprocess.run(
+                      ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", norm_file],
+                      capture_output=True, text=True
+                  )
+                  try:
+                      dur = float(probe.stdout.strip())
+                  except:
+                      dur = 0.0
+                  if dur > 5.0:
+                      valid_mp4s.append(norm_file)
+                      accumulated_dur += dur
+                      print(f"Clip {idx} hinzugefügt ({dur:.1f}s) -> Gesamtdauer: {accumulated_dur:.1f}s")
 
-          concat_str = "concat:" + "|".join(ts_files)
+          if not valid_mp4s:
+              raise RuntimeError("Kein einziger Clip konnte geladen werden!")
 
-          # Extrahiere sauberes 16kHz WAV-Audio für 100% zuverlässige Whisper-Untertitel (Deckelung bei 75 Sek.)
+          while accumulated_dur < 62.0:
+              valid_mp4s.append(valid_mp4s[0])
+              accumulated_dur += 30.0
+
+          with open("concat_list.txt", "w", encoding="utf-8") as f:
+              for mp4 in valid_mp4s:
+                  f.write(f"file '{mp4}'\n")
+
+          # Verbinde alle Clips mit durchgehenden Zeitstempeln (+genpts) zu stitched.mp4
           subprocess.run([
-              "ffmpeg", "-y", "-i", concat_str, "-t", "75",
+              "ffmpeg", "-y", "-fflags", "+genpts", "-f", "concat", "-safe", "0",
+              "-i", "concat_list.txt", "-t", "75", "-c", "copy", "stitched.mp4"
+          ], check=True)
+
+          # Extrahiere WAV-Audio aus dem kompletten Zusammenschnitt für Whisper
+          subprocess.run([
+              "ffmpeg", "-y", "-i", "stitched.mp4",
               "-vn", "-acodec", "pcm_s16le", "-ar", "16000", "-ac", "1", "audio.wav"
           ], check=True)
 
@@ -107,7 +144,6 @@ jobs:
               condition_on_previous_text=False
           )
 
-          sub_count = 0
           for seg in segments:
               words = seg.words or []
               if words:
@@ -120,7 +156,6 @@ jobs:
                           txt = " ".join(x.word.strip() for x in chunk).upper().replace("{", "").replace("}", "")
                           if txt:
                               ass_lines.append(f"Dialogue: 3,{start_t},{end_t},Subs,,0,0,0,,{txt}")
-                              sub_count += 1
                           chunk = []
                   if chunk:
                       start_t = fmt_time(chunk[0].start)
@@ -128,9 +163,7 @@ jobs:
                       txt = " ".join(x.word.strip() for x in chunk).upper().replace("{", "").replace("}", "")
                       if txt:
                           ass_lines.append(f"Dialogue: 3,{start_t},{end_t},Subs,,0,0,0,,{txt}")
-                          sub_count += 1
               else:
-                  # Fallback, falls Wort-Zeitstempel bei extremem Geschrei leer sind
                   raw_words = seg.text.strip().upper().replace("{", "").replace("}", "").split()
                   if raw_words:
                       dur = max(seg.end - seg.start, 0.5)
@@ -140,15 +173,12 @@ jobs:
                           st = fmt_time(seg.start + idx_c * step)
                           et = fmt_time(seg.start + (idx_c + 1) * step)
                           ass_lines.append(f"Dialogue: 3,{st},{et},Subs,,0,0,0,,{' '.join(c_words)}")
-                          sub_count += 1
-
-          print(f"Generierte Untertitel-Blöcke: {sub_count}")
 
           with open("overlay.ass", "w", encoding="utf-8") as f:
               f.write("\n".join(ass_lines))
 
           cmd = [
-              "ffmpeg", "-y", "-i", concat_str, "-t", "75",
+              "ffmpeg", "-y", "-i", "stitched.mp4",
               "-filter_complex",
               "[0:v]scale=1080:608:force_original_aspect_ratio=decrease,pad=1080:608:(ow-iw)/2:(oh-ih)/2[top];"
               "[0:v]scale=-2:1312,crop=1080:1312:(iw-1080)/2:0,eq=saturation=1.05[bot];"
