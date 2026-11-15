@@ -30,8 +30,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y ffmpeg fonts-dejavu-core curl
-          python3 -m pip install --upgrade pip
-          python3 -m pip install faster-whisper
+          pip install --quiet faster-whisper --break-system-packages || pip install --quiet faster-whisper
 
       - name: Download, Stitch, Transcribe & Render 9:16 Video
         env:
@@ -58,19 +57,18 @@ jobs:
               raw_file = f"raw_{idx}.mp4"
               norm_file = f"norm_{idx}.mp4"
               
-              # Lade Clip herunter (ohne Abbruch bei toter Einzel-URL)
               dl = subprocess.run(["curl", "-L", "--fail", "--retry", "2", "-A", "Mozilla/5.0", url, "-o", raw_file])
               if dl.returncode != 0 or not os.path.exists(raw_file) or os.path.getsize(raw_file) < 50000:
                   print(f"Überspringe defekte URL {idx}")
                   continue
 
-              # Normalisiere mit fester Timescale (30000) für nahtlosen Zusammenschnitt
               norm_cmd = [
                   "ffmpeg", "-y", "-i", raw_file,
                   "-vf", "scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2,fps=30,format=yuv420p",
                   "-af", "aresample=44100,aformat=sample_fmts=fltp:channel_layouts=stereo",
-                  "-c:v", "libx264", "-preset", "ultrafast", "-crf", "20", "-video_track_timescale", "30000",
-                  "-c:a", "aac", "-b:a", "128k", norm_file
+                  "-c:v", "libx264", "-preset", "ultrafast", "-crf", "20",
+                  "-c:a", "aac", "-b:a", "128k", "-ar", "44100", "-ac", "2",
+                  norm_file
               ]
               if subprocess.run(norm_cmd).returncode == 0:
                   probe = subprocess.run(
@@ -97,13 +95,15 @@ jobs:
               for mp4 in valid_mp4s:
                   f.write(f"file '{mp4}'\n")
 
-          # Verbinde alle Clips mit durchgehenden Zeitstempeln (+genpts) zu stitched.mp4
+          # Sauberes Neu-Codieren beim Zusammenfügen verhindert Zeitstempel-Abbrüche nach Clip 1
           subprocess.run([
-              "ffmpeg", "-y", "-fflags", "+genpts", "-f", "concat", "-safe", "0",
-              "-i", "concat_list.txt", "-t", "75", "-c", "copy", "stitched.mp4"
+              "ffmpeg", "-y", "-f", "concat", "-safe", "0",
+              "-i", "concat_list.txt", "-t", "75",
+              "-c:v", "libx264", "-preset", "ultrafast", "-crf", "20",
+              "-c:a", "aac", "-b:a", "128k",
+              "stitched.mp4"
           ], check=True)
 
-          # Extrahiere WAV-Audio aus dem kompletten Zusammenschnitt für Whisper
           subprocess.run([
               "ffmpeg", "-y", "-i", "stitched.mp4",
               "-vn", "-acodec", "pcm_s16le", "-ar", "16000", "-ac", "1", "audio.wav"
@@ -134,45 +134,48 @@ jobs:
               f"Dialogue: 1,0:00:00.00,0:05:00.00,Credit,,0,0,0,,{credit}"
           ]
 
-          model = WhisperModel("base", device="cpu", compute_type="int8")
-          segments, _ = model.transcribe(
-              "audio.wav",
-              word_timestamps=True,
-              vad_filter=False,
-              no_speech_threshold=0.9,
-              log_prob_threshold=-2.0,
-              condition_on_previous_text=False
-          )
+          try:
+              model = WhisperModel("base", device="cpu", compute_type="int8")
+              segments, _ = model.transcribe(
+                  "audio.wav",
+                  word_timestamps=True,
+                  vad_filter=False,
+                  no_speech_threshold=0.9,
+                  log_prob_threshold=-2.0,
+                  condition_on_previous_text=False
+              )
 
-          for seg in segments:
-              words = seg.words or []
-              if words:
-                  chunk = []
-                  for w in words:
-                      chunk.append(w)
-                      if len(chunk) >= 3:
+              for seg in segments:
+                  words = seg.words or []
+                  if words:
+                      chunk = []
+                      for w in words:
+                          chunk.append(w)
+                          if len(chunk) >= 3:
+                              start_t = fmt_time(chunk[0].start)
+                              end_t = fmt_time(chunk[-1].end)
+                              txt = " ".join(x.word.strip() for x in chunk).upper().replace("{", "").replace("}", "")
+                              if txt:
+                                  ass_lines.append(f"Dialogue: 3,{start_t},{end_t},Subs,,0,0,0,,{txt}")
+                              chunk = []
+                      if chunk:
                           start_t = fmt_time(chunk[0].start)
                           end_t = fmt_time(chunk[-1].end)
                           txt = " ".join(x.word.strip() for x in chunk).upper().replace("{", "").replace("}", "")
                           if txt:
                               ass_lines.append(f"Dialogue: 3,{start_t},{end_t},Subs,,0,0,0,,{txt}")
-                          chunk = []
-                  if chunk:
-                      start_t = fmt_time(chunk[0].start)
-                      end_t = fmt_time(chunk[-1].end)
-                      txt = " ".join(x.word.strip() for x in chunk).upper().replace("{", "").replace("}", "")
-                      if txt:
-                          ass_lines.append(f"Dialogue: 3,{start_t},{end_t},Subs,,0,0,0,,{txt}")
-              else:
-                  raw_words = seg.text.strip().upper().replace("{", "").replace("}", "").split()
-                  if raw_words:
-                      dur = max(seg.end - seg.start, 0.5)
-                      chunks = [raw_words[i:i+3] for i in range(0, len(raw_words), 3)]
-                      step = dur / len(chunks)
-                      for idx_c, c_words in enumerate(chunks):
-                          st = fmt_time(seg.start + idx_c * step)
-                          et = fmt_time(seg.start + (idx_c + 1) * step)
-                          ass_lines.append(f"Dialogue: 3,{st},{et},Subs,,0,0,0,,{' '.join(c_words)}")
+                  else:
+                      raw_words = seg.text.strip().upper().replace("{", "").replace("}", "").split()
+                      if raw_words:
+                          dur = max(seg.end - seg.start, 0.5)
+                          chunks = [raw_words[i:i+3] for i in range(0, len(raw_words), 3)]
+                          step = dur / len(chunks)
+                          for idx_c, c_words in enumerate(chunks):
+                              st = fmt_time(seg.start + idx_c * step)
+                              et = fmt_time(seg.start + (idx_c + 1) * step)
+                              ass_lines.append(f"Dialogue: 3,{st},{et},Subs,,0,0,0,,{' '.join(c_words)}")
+          except Exception as e:
+              print("Whisper Warnung:", e)
 
           with open("overlay.ass", "w", encoding="utf-8") as f:
               f.write("\n".join(ass_lines))
