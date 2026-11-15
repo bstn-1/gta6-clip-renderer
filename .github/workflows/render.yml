@@ -29,8 +29,8 @@ jobs:
       - name: Install FFmpeg, Fonts & Whisper AI
         run: |
           sudo apt-get update
-          sudo apt-get install -y ffmpeg fonts-dejavu-core curl
-          pip install --quiet faster-whisper --break-system-packages || pip install --quiet faster-whisper
+          sudo apt-get install -y ffmpeg fonts-dejavu-core curl python3-pip
+          python3 -m pip install --break-system-packages faster-whisper || pip install faster-whisper
 
       - name: Download, Stitch, Transcribe & Render 9:16 Video
         env:
@@ -69,10 +69,11 @@ jobs:
                   print(f"Überspringe defekte URL {idx}")
                   continue
 
+              # Normalisiere Video & erzwinge eine durchgängige Stereo-Tonspur
               norm_cmd = [
                   "ffmpeg", "-y", "-i", raw_file,
                   "-vf", "scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2,fps=30,format=yuv420p",
-                  "-af", "aresample=44100,aformat=sample_fmts=fltp:channel_layouts=stereo",
+                  "-af", "aresample=44100:async=1,aformat=sample_fmts=fltp:channel_layouts=stereo",
                   "-c:v", "libx264", "-preset", "ultrafast", "-crf", "20",
                   "-c:a", "aac", "-b:a", "128k", "-ar", "44100", "-ac", "2",
                   norm_file
@@ -111,12 +112,15 @@ jobs:
               "stitched.mp4"
           ], check=True)
 
+          # Extrahiere Sprach-optimiertes Audio (filtert Motoren-Bass <150Hz und Rauschen weg + Lautstärke-Boost)
           subprocess.run([
               "ffmpeg", "-y", "-i", "stitched.mp4",
-              "-vn", "-acodec", "pcm_s16le", "-ar", "16000", "-ac", "1", "audio.wav"
+              "-vn", "-af", "highpass=f=150,lowpass=f=3500,dynaudnorm",
+              "-acodec", "pcm_s16le", "-ar", "16000", "-ac", "1", "audio.wav"
           ], check=True)
 
           def fmt_time(seconds):
+              seconds = max(0.0, float(seconds))
               h = int(seconds // 3600)
               m = int((seconds % 3600) // 60)
               s = seconds % 60
@@ -133,14 +137,13 @@ jobs:
               "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding",
               "Style: Hook,DejaVu Sans,52,&H00FFFFFF,&H00FFFFFF,&H001200E6,&H001200E6,-1,0,0,0,100,100,0,0,3,20,0,8,60,60,90,1",
               "Style: Credit,DejaVu Sans,42,&H00FFFFFF,&H00FFFFFF,&H00FF4691,&H00FF4691,-1,0,0,0,100,100,0,0,3,16,0,8,80,80,580,1",
-              "Style: Subs,DejaVu Sans,68,&H0000E6FF,&H00FFFFFF,&H00000000,&H80000000,-1,0,0,0,100,100,0,0,1,8,3,2,70,70,260,1",
+              "Style: Subs,DejaVu Sans,70,&H0000E6FF,&H00FFFFFF,&H00000000,&H80000000,-1,0,0,0,100,100,0,0,1,9,4,2,70,70,280,1",
               "",
               "[Events]",
               "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text",
               f"Dialogue: 2,0:00:00.00,0:00:04.50,Hook,,0,0,0,,{hook}"
           ]
 
-          # Dynamischer Streamer-Credit exakt passend zum jeweiligen Clip-Zeitfenster
           cur_t = 0.0
           for _, dur, clip_credit in valid_clips:
               if cur_t >= 75.0:
@@ -150,48 +153,36 @@ jobs:
               ass_lines.append(f"Dialogue: 1,{st},{et},Credit,,0,0,0,,{clip_credit}")
               cur_t += dur
 
+          sub_count = 0
           try:
-              model = WhisperModel("base", device="cpu", compute_type="int8")
+              model = WhisperModel("small", device="cpu", compute_type="int8")
               segments, _ = model.transcribe(
                   "audio.wav",
-                  word_timestamps=True,
+                  beam_size=1,
                   vad_filter=False,
-                  no_speech_threshold=0.9,
-                  log_prob_threshold=-2.0,
+                  no_speech_threshold=0.95,
+                  log_prob_threshold=-2.5,
+                  compression_ratio_threshold=3.5,
                   condition_on_previous_text=False
               )
 
               for seg in segments:
-                  words = seg.words or []
-                  if words:
-                      chunk = []
-                      for w in words:
-                          chunk.append(w)
-                          if len(chunk) >= 3:
-                              start_t = fmt_time(chunk[0].start)
-                              end_t = fmt_time(chunk[-1].end)
-                              txt = " ".join(x.word.strip() for x in chunk).upper().replace("{", "").replace("}", "")
-                              if txt:
-                                  ass_lines.append(f"Dialogue: 3,{start_t},{end_t},Subs,,0,0,0,,{txt}")
-                              chunk = []
-                      if chunk:
-                          start_t = fmt_time(chunk[0].start)
-                          end_t = fmt_time(chunk[-1].end)
-                          txt = " ".join(x.word.strip() for x in chunk).upper().replace("{", "").replace("}", "")
-                          if txt:
-                              ass_lines.append(f"Dialogue: 3,{start_t},{end_t},Subs,,0,0,0,,{txt}")
-                  else:
-                      raw_words = seg.text.strip().upper().replace("{", "").replace("}", "").split()
-                      if raw_words:
-                          dur = max(seg.end - seg.start, 0.5)
-                          chunks = [raw_words[i:i+3] for i in range(0, len(raw_words), 3)]
-                          step = dur / len(chunks)
-                          for idx_c, c_words in enumerate(chunks):
-                              st = fmt_time(seg.start + idx_c * step)
-                              et = fmt_time(seg.start + (idx_c + 1) * step)
-                              ass_lines.append(f"Dialogue: 3,{st},{et},Subs,,0,0,0,,{' '.join(c_words)}")
+                  clean_text = seg.text.strip().upper().replace("{", "").replace("}", "").replace("\\", "")
+                  raw_words = [w for w in clean_text.split() if w]
+                  if not raw_words:
+                      continue
+                  dur = max(seg.end - seg.start, 0.6)
+                  chunks = [raw_words[i:i+3] for i in range(0, len(raw_words), 3)]
+                  step = dur / len(chunks)
+                  for idx_c, c_words in enumerate(chunks):
+                      st = fmt_time(seg.start + idx_c * step)
+                      et = fmt_time(seg.start + (idx_c + 1) * step)
+                      ass_lines.append(f"Dialogue: 3,{st},{et},Subs,,0,0,0,,{' '.join(c_words)}")
+                      sub_count += 1
           except Exception as e:
-              print("Whisper Warnung:", e)
+              print("Whisper Fehler:", e)
+
+          print(f"Generierte Untertitel-Zeilen: {sub_count}")
 
           with open("overlay.ass", "w", encoding="utf-8") as f:
               f.write("\n".join(ass_lines))
