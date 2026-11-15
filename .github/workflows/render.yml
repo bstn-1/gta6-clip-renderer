@@ -1,0 +1,127 @@
+name: GTA6 Cloud Video Renderer
+
+on:
+  workflow_dispatch:
+    inputs:
+      video_url:
+        description: 'Direct Twitch MP4 URL'
+        required: true
+      hook_text:
+        description: 'Hook Text (Top Banner)'
+        required: true
+      streamer_tag:
+        description: 'Streamer Credit'
+        required: true
+      clip_id:
+        description: 'Unique Clip ID'
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  render:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Install FFmpeg, Fonts & Whisper AI
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg fonts-dejavu-core curl
+          pip install --quiet faster-whisper
+
+      - name: Download Twitch Source MP4
+        env:
+          VIDEO_URL: ${{ github.event.inputs.video_url }}
+        run: |
+          curl -L --fail --retry 3 -A "Mozilla/5.0" "$VIDEO_URL" -o input.mp4
+          ls -lh input.mp4
+
+      - name: Generate Subtitles & Render 9:16 Video
+        env:
+          HOOK_TEXT: ${{ github.event.inputs.hook_text }}
+          STREAMER_TAG: ${{ github.event.inputs.streamer_tag }}
+          CLIP_ID: ${{ github.event.inputs.clip_id }}
+        run: |
+          python3 - << 'EOF'
+          import os, subprocess
+          from faster_whisper import WhisperModel
+
+          hook = os.environ.get("HOOK_TEXT", "KRASSER GTA MOMENT!").replace("\n", " ").replace("{", "").replace("}", "")
+          credit = os.environ.get("STREAMER_TAG", "Credit: @Twitch").replace("\n", " ").replace("{", "").replace("}", "")
+          clip_id = os.environ.get("CLIP_ID", "output")
+
+          def fmt_time(seconds):
+              h = int(seconds // 3600)
+              m = int((seconds % 3600) // 60)
+              s = seconds % 60
+              return f"{h}:{m:02d}:{s:05.2f}"
+
+          ass_lines = [
+              "[Script Info]",
+              "ScriptType: v4.00+",
+              "PlayResX: 1080",
+              "PlayResY: 1920",
+              "WrapStyle: 1",
+              "",
+              "[V4+ Styles]",
+              "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding",
+              "Style: Hook,DejaVu Sans,54,&H00FFFFFF,&H00FFFFFF,&H001200E6,&H001200E6,-1,0,0,0,100,100,0,0,3,22,0,8,70,70,220,1",
+              "Style: Credit,DejaVu Sans,42,&H00FFFFFF,&H00FFFFFF,&H00FF4691,&H00FF4691,-1,0,0,0,100,100,0,0,3,16,0,8,90,90,460,1",
+              "Style: Subs,DejaVu Sans,68,&H0000E6FF,&H00FFFFFF,&H00000000,&H80000000,-1,0,0,0,100,100,0,0,1,8,3,2,70,70,380,1",
+              "",
+              "[Events]",
+              "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text",
+              f"Dialogue: 2,0:00:00.00,0:00:04.00,Hook,,0,0,0,,{hook}",
+              f"Dialogue: 1,0:00:00.00,0:05:00.00,Credit,,0,0,0,,{credit}"
+          ]
+
+          try:
+              model = WhisperModel("base", device="cpu", compute_type="int8")
+              segments, _ = model.transcribe("input.mp4", word_timestamps=True)
+              for seg in segments:
+                  words = seg.words or []
+                  chunk = []
+                  for w in words:
+                      chunk.append(w)
+                      if len(chunk) >= 3:
+                          start_t = fmt_time(chunk[0].start)
+                          end_t = fmt_time(chunk[-1].end)
+                          txt = " ".join(x.word.strip() for x in chunk).upper().replace("{", "").replace("}", "")
+                          ass_lines.append(f"Dialogue: 3,{start_t},{end_t},Subs,,0,0,0,,{txt}")
+                          chunk = []
+                  if chunk:
+                      start_t = fmt_time(chunk[0].start)
+                      end_t = fmt_time(chunk[-1].end)
+                      txt = " ".join(x.word.strip() for x in chunk).upper().replace("{", "").replace("}", "")
+                      ass_lines.append(f"Dialogue: 3,{start_t},{end_t},Subs,,0,0,0,,{txt}")
+          except Exception as e:
+              print("Whisper info:", e)
+
+          with open("overlay.ass", "w", encoding="utf-8") as f:
+              f.write("\n".join(ass_lines))
+
+          cmd = [
+              "ffmpeg", "-y", "-i", "input.mp4",
+              "-filter_complex",
+              "[0:v]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,boxblur=25:5,eq=brightness=-0.25[bg];"
+              "[0:v]scale=1080:-2,eq=saturation=1.04[fg];"
+              "[bg][fg]overlay=(W-w)/2:(H-h)/2,ass=overlay.ass[v]",
+              "-map", "[v]", "-map", "0:a?",
+              "-af", "volume=0.98",
+              "-c:v", "libx264", "-preset", "veryfast", "-crf", "23", "-pix_fmt", "yuv420p",
+              "-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart",
+              f"clip_{clip_id}.mp4"
+          ]
+          subprocess.run(cmd, check=True)
+          EOF
+
+      - name: Publish MP4 to GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CLIP_ID: ${{ github.event.inputs.clip_id }}
+        run: |
+          gh release create latest --title "Rendered Clips" --notes "Auto-generated clips" || true
+          gh release upload latest "clip_${CLIP_ID}.mp4" --clobber
