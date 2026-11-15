@@ -4,13 +4,13 @@ on:
   workflow_dispatch:
     inputs:
       video_url:
-        description: 'Direct Twitch MP4 URLs (pipe separated)'
+        description: 'Direct Twitch MP4 URLs (pipe separated with Streamer:: prefix)'
         required: true
       hook_text:
         description: 'Hook Text (Top Banner)'
         required: true
       streamer_tag:
-        description: 'Streamer Credit'
+        description: 'Fallback Streamer Credit'
         required: true
       clip_id:
         description: 'Unique Clip ID'
@@ -43,17 +43,24 @@ jobs:
           import os, subprocess
           from faster_whisper import WhisperModel
 
-          urls = [u.strip() for u in os.environ.get("VIDEO_URL", "").split("|") if u.strip()]
+          entries = [u.strip() for u in os.environ.get("VIDEO_URL", "").split("|") if u.strip()]
           hook = os.environ.get("HOOK_TEXT", "KRASSER GTA MOMENT!").replace("\n", " ").replace("{", "").replace("}", "")
-          credit = os.environ.get("STREAMER_TAG", "Credit: @Twitch").replace("\n", " ").replace("{", "").replace("}", "")
+          fallback_credit = os.environ.get("STREAMER_TAG", "Credit: @Twitch").replace("\n", " ").replace("{", "").replace("}", "")
           clip_id = os.environ.get("CLIP_ID", "output")
 
-          valid_mp4s = []
+          valid_clips = []
           accumulated_dur = 0.0
 
-          for idx, url in enumerate(urls):
+          for idx, entry in enumerate(entries):
               if accumulated_dur >= 65.0:
                   break
+              if "::" in entry:
+                  st_name, url = entry.split("::", 1)
+                  clip_credit = f"Credit: @{st_name.strip()}".replace("{", "").replace("}", "")
+              else:
+                  clip_credit = fallback_credit
+                  url = entry
+
               raw_file = f"raw_{idx}.mp4"
               norm_file = f"norm_{idx}.mp4"
               
@@ -80,22 +87,22 @@ jobs:
                   except:
                       dur = 0.0
                   if dur > 5.0:
-                      valid_mp4s.append(norm_file)
+                      valid_clips.append((norm_file, dur, clip_credit))
                       accumulated_dur += dur
-                      print(f"Clip {idx} hinzugefügt ({dur:.1f}s) -> Gesamtdauer: {accumulated_dur:.1f}s")
+                      print(f"Clip {idx} ({clip_credit}) hinzugefügt ({dur:.1f}s) -> Gesamtdauer: {accumulated_dur:.1f}s")
 
-          if not valid_mp4s:
+          if not valid_clips:
               raise RuntimeError("Kein einziger Clip konnte geladen werden!")
 
           while accumulated_dur < 62.0:
-              valid_mp4s.append(valid_mp4s[0])
-              accumulated_dur += 30.0
+              first_file, first_dur, first_cred = valid_clips[0]
+              valid_clips.append((first_file, first_dur, first_cred))
+              accumulated_dur += first_dur
 
           with open("concat_list.txt", "w", encoding="utf-8") as f:
-              for mp4 in valid_mp4s:
+              for mp4, _, _ in valid_clips:
                   f.write(f"file '{mp4}'\n")
 
-          # Sauberes Neu-Codieren beim Zusammenfügen verhindert Zeitstempel-Abbrüche nach Clip 1
           subprocess.run([
               "ffmpeg", "-y", "-f", "concat", "-safe", "0",
               "-i", "concat_list.txt", "-t", "75",
@@ -130,9 +137,18 @@ jobs:
               "",
               "[Events]",
               "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text",
-              f"Dialogue: 2,0:00:00.00,0:00:04.50,Hook,,0,0,0,,{hook}",
-              f"Dialogue: 1,0:00:00.00,0:05:00.00,Credit,,0,0,0,,{credit}"
+              f"Dialogue: 2,0:00:00.00,0:00:04.50,Hook,,0,0,0,,{hook}"
           ]
+
+          # Dynamischer Streamer-Credit exakt passend zum jeweiligen Clip-Zeitfenster
+          cur_t = 0.0
+          for _, dur, clip_credit in valid_clips:
+              if cur_t >= 75.0:
+                  break
+              st = fmt_time(cur_t)
+              et = fmt_time(min(cur_t + dur, 75.0))
+              ass_lines.append(f"Dialogue: 1,{st},{et},Credit,,0,0,0,,{clip_credit}")
+              cur_t += dur
 
           try:
               model = WhisperModel("base", device="cpu", compute_type="int8")
